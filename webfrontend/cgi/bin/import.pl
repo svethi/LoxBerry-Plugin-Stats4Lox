@@ -105,7 +105,7 @@ our $loglevel=4;
 ##########################################################################
 
 # Version of this script
-$version = "0.1.2";
+$version = "0.1.4";
 
 # Figure out in which subfolder we are installed
 # Does not work (returns 'bin')
@@ -210,6 +210,7 @@ my $db_nr = sprintf("%04d", $job->param("db_nr"));
 my $import_epoch = $job->param("import_epoch");
 my $job_useramdisk = $job->param("useramdisk");
 my $job_loglevel = $job->param("loglevel");
+my $importtype = $job->param("importtype");
 
 $job->param("Last status",	"Running");
 $job->write();
@@ -265,7 +266,6 @@ if ($job_loglevel)		{ $loglevel = $job_loglevel; }
 # Some RRD file processing 
 ##############################
 
-# our $rrdtool = '/usr/bin/rrdtool';
 our $rrdfile = "$installfolder/data/plugins/$psubfolder/databases/$db_nr.rrd";
 if (! -e $rrdfile) {
 	logger(1, "RRD-File $rrdfile does not exist - Terminating");
@@ -300,28 +300,43 @@ if ($use_ram_disk) {
 	}
 }
 
-# Get last update time 	(replaced by RRDs::info)
-# our $lastupdate_ep = RRDs::last($rrdfile);
-# my $ERR=RRDs::error;
-# if ($ERR) {
-	# logger(1, "Error processing rrds::last: $ERR");
-# }
-# logger(4, "RRD last update epoch RAW: $lastupdate_ep");
-
 # Get RRD infos
 my $rrdinfo = RRDs::info ($rrdfile);
 my $ERR=RRDs::error;
 if ($ERR) {
 	logger(1, "Error processing RRDs::info: $ERR");
-	logger(2, "Assuming lastupdate=never and stepsize=300. There might come up more troubles later...");
+	logger(1, "Assuming lastupdate=never and stepsize=300. There might come up more troubles later...");
 
 	our $lastupdate_ep = 0;
 	our $rrd_step = 300;
 } else {
 	our $lastupdate_ep = $$rrdinfo{'last_update'};
 	our $rrd_step = $$rrdinfo{'step'};
+	# Get Datasource type (GAUGE, COUNTER ...)
+	our $rrd_dstype = %$rrdinfo{'ds[value].type'};
+	if (! $rrd_dstype) {
+		# if the default datasource is not found, let's do fuzzy search
+		foreach my $key (sort keys %$rrdinfo){
+			# print "$key = $$hash{$key}\n";
+			if (index($key, ".type") != -1) {
+				$rrd_dstype = $$hash{$key}; 
+				last;
+			}		
+		}
+	}
 }
+
 logger(4, "RRD lastupdate (epoch): $lastupdate_ep , Stepsize $rrd_step seconds.");
+
+our $rrd_useint;
+if ($rrd_dstype eq 'COUNTER' || $rrd_dstype eq 'DERIVE' || $rrd_dstype eq 'ABSOLUTE') { 
+	$rrd_useint = 1;
+	logger(4, "RRD Datasource type is $rrd_dstype. Values will be rounded to INTEGER.");
+} else {
+	$rrd_useint = undef;
+	logger(4, "RRD Datasource type is $rrd_dstype. Values are used as they are - FLOAT.");
+}
+
 
 # If timestamp is earlier then 0 of Loxone-time, set it to Loxone-time 0 == 1230768000 Epoch
 if ($lastupdate_ep < 1230768000) {
@@ -334,11 +349,6 @@ if ($lastupdate_ep < 1230768000) {
 ##
 ##
 
-
-# Try some time calculation for warming up
-# $lastupdate_str = strftime '%d.%m.%Y %H:%M:%S', localtime $lastupdate_ep;
-
-#my $lastupdate_dt = DateTime->from_epoch( epoch => $lastupdate_ep ); 
 my $lastupdate = Time::Piece->new();
 $lastupdate = $lastupdate->strptime($lastupdate_ep, '%s');
 
@@ -447,9 +457,7 @@ for (my $year=$lastupdate_year; $year <= $now->year; $year++) {
 				my $nextnode = $data->nextSibling();
 				$interpolation_count+= interpolate($data, $nextnode, $data->{V});
 			}
-			
-			
-			
+						
 			@dataset = $root->getChildrenByTagName("S");
 		
 			logger(3, "   Interpolation finished - Added data: $interpolation_count, Data count now " . keys @dataset);
@@ -468,9 +476,6 @@ for (my $year=$lastupdate_year; $year <= $now->year; $year++) {
 		# <S T="2016-08-17 23:47:00" V="0.572" V2="0.000"/>
 		# <S T="2016-08-17 23:48:00" V="0.572" V2="0.000"/>
 		
-		# my @data_value_array;
-		# my $data_array_nr = 0;
-		
 		our $data_counter = 0;
 		our @data_value_array;
 		
@@ -483,11 +488,19 @@ for (my $year=$lastupdate_year; $year <= $now->year; $year++) {
 			}
 			
 			$data_counter++;
-			#logger(4, "   --> Datapoint Date/Time $data->{T} Epoch: " . $data_time->epoch . " Value: $data->{V}"); # Many logs
-			push (@data_value_array, $data_time->epoch . ':' . $data->{V});
+			# logger(4, "   --> Datapoint Date/Time $data->{T} Epoch: " . $data_time->epoch . " Value: $data->{V}"); # Many logs
+			
+			# If INT has to be used, round to INT, otherwise do not modify values
+			if (! $rrd_useint) {
+				# FLOAT
+				push (@data_value_array, $data_time->epoch . ':' . $data->{V});
+			} else {
+				# INT (use POSIX ceil to avoid installing Math::Round)
+				push (@data_value_array, $data_time->epoch . ':' . ceil($data->{V}));
+			}
 			
 			# For every x datapoints update RRD
-			if ($data_counter%2000 == 0) {
+			if ($data_counter%1000 == 0) {
 				rrdupdate();
 			}	
 		}
@@ -508,8 +521,8 @@ for (my $year=$lastupdate_year; $year <= $now->year; $year++) {
 		logger (3, "   $data_counter datapoints updated in " . ceil($run_time) . " seconds.");
 		logger (3, "=============== $month/$year === FINISHED =============================================");
 		# We have to break out of the loop if we have reached the current year/month
-		# Issue - if current month/year fails, this code is never reached to quit loop
-		if ($year == $now->year && $month == $now->mon) {
+		# Issue - if current month/year fails, this code possibly is never reached to quit loop
+		if ($year >= $now->year && $month >= $now->mon) {
 			last;
 		}
 	# End of month loop
@@ -523,8 +536,26 @@ copyramdisk('Save');
 copyramdisk('Fast');
 copyramdisk('Dirty');
 
-$job->param("Last status",	"Finished!");
+$job->param("Last status",	"Finished Import!");
 $job->write();
+
+# If job requests to immediately start live polling
+if ($importtype eq 'import_start') {
+	logger(3, "=== Start live polling requested ===");
+	if (open(F,">$installfolder/data/plugins/$psubfolder/databases/$db_nr.status")) {
+		flock(F, 2);
+		print F "2";
+		close F;
+        logger(4, "   Statistic status set to 2 (0=stopped, 1=paused, 2=running, 3=?");
+		$job->param("Last status",	"Finished Import and started polling!");
+		$job->write();
+
+	} else {
+		logger(2, "   Start of live polling could not be initiated. Please try manually.");
+		$job->param("Last status",	"Finished Import! But could not start polling.");
+		$job->write();
+	}
+}
 
 # Rename the job file
 if (! move("$job_basepath/$jobname.running.$$", "$job_basepath/$jobname.finished")) {
